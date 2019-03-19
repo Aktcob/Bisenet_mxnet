@@ -3,10 +3,11 @@ import numpy as np
 import mxnet as mx
 from mxnet import gluon
 from mxnet import symbol
+from mxnet import autograd
 from mxnet.gluon import nn
 from mxnet import initializer
 from mxnet import ndarray as nd
-from gluoncv.model_zoo.resnetv1b import resnet18_v1b
+from gluoncv.model_zoo.resnetv1b import resnet18_v1b,resnet50_v1s
 
 # define Conv-Bn-Relu function
 def ConvBnRelu(in_channels,out_channels,kernel_size,strides,padding):
@@ -31,7 +32,8 @@ class ARM(nn.HybridBlock):
         se = self.conv(se)
         se = self.bn(se)
         se = F.sigmoid(se)
-        out = se*in_
+        out = F.broadcast_mul(in_, se)
+        # out = in_*se
         return out
 
 #FFM
@@ -50,7 +52,7 @@ class FFM(nn.HybridBlock):
         x = F.relu(x)
         x = self.conv2(x)
         x = F.sigmoid(x)
-        out = fusion_in + fusion_in*x
+        out = fusion_in + F.broadcast_mul(fusion_in,x)
         return out
 
 #Spatial
@@ -94,7 +96,8 @@ class Context(nn.HybridBlock):
         self.aux_conv2.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
 
     def hybrid_forward(self,F,x):
-        _,_,h,w = x.shape
+        # _,_,h,w = x.shape
+        h, w = 1024, 1024
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -110,19 +113,23 @@ class Context(nn.HybridBlock):
         global_feature_up = F.contrib.BilinearResize2D(global_feature,height = h//32,width = w//32)
         ARM32 = global_feature_up + f32
         ARM32_up = F.contrib.BilinearResize2D(ARM32,height = h//16,width = w//16)
+        # if autograd.is_training():
         ARM32_up = self.aux_conv1(ARM32_up)  # aux_loss1
 
         ARM16 = f16 + ARM32_up
         ARM16_up = F.contrib.BilinearResize2D(ARM16,height = h//8,width = w//8)
         ARM16_up = self.aux_conv2(ARM16_up)
+        # if autograd.is_training():
         return ARM32_up, ARM16_up
+        # else:
+            # return ARM16_up
 
 class BisenetHead(nn.HybridBlock):
-    def __init__(self,in_channels,out_channels,aux=False,h=480,w=480,**kwargs):
+    def __init__(self,in_channels,out_channels,choice=False,h=480,w=480,**kwargs):
         super(BisenetHead,self).__init__(**kwargs)
         self.h = h
         self.w = w
-        if aux:
+        if choice:
             self.conv1 = ConvBnRelu(in_channels,128,3,1,1)
             self.conv2 = ConvBnRelu(128,out_channels,1,1,0)
         else:
@@ -138,40 +145,43 @@ class BisenetHead(nn.HybridBlock):
 
 
 class Bisenet(nn.HybridBlock):
-    def __init__(self,class_num,channels = 256,**kwargs):
+    def __init__(self,class_num,channels = 256,aux=True,**kwargs):
         super(Bisenet,self).__init__(**kwargs)
-        w,h =480,480
+        self.aux = aux
+        w,h =1024,1024
         self.spatial = Spatial()
         self.spatial.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
         self.context = Context()
         self.ffm = FFM(256,channels)
         self.ffm.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
-        self.mainhead = BisenetHead(256,class_num,False,480,480)
+        self.mainhead = BisenetHead(256,class_num,False,w,h)
         self.mainhead.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
-        self.aux1head = BisenetHead(128,class_num,True,480,480)
-        self.aux1head.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
-        self.aux2head = BisenetHead(128,class_num,True,480,480)
-        self.aux2head.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
+        if self.aux:
+            self.aux1head = BisenetHead(128,class_num,True,w,h)
+            self.aux1head.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
+            self.aux2head = BisenetHead(128,class_num,True,w,h)
+            self.aux2head.initialize(init=initializer.Xavier(),ctx=mx.gpu(0))
     def hybrid_forward(self,F,x):
         outputs = []
         # _,_,h,w = x.shape
         s_path = self.spatial(x)
         # print "s_path",s_path.shape
         c32_path, c16_path = self.context(x)
-
-        aux1 = self.aux1head(c16_path)
-        aux2 = self.aux2head(c32_path)
-        # print "c_path",c_path.shape
         ffm_ = self.ffm(s_path,c16_path)
         out = self.mainhead(ffm_)
-        outputs.append(aux1)
-        outputs.append(aux2)
-        outputs.append(out)
-        return tuple(outputs)
+        if self.aux:
+            aux1 = self.aux1head(c16_path)
+            aux2 = self.aux2head(c32_path)
+            outputs.append(aux1)
+            outputs.append(aux2)
+            outputs.append(out)
+        if autograd.is_training(): 
+            return tuple(outputs)
+        else:
+            outputs.append(F.squeeze(F.argmax(out, 1)))
+            return tuple(outputs)
+            # return tuple(out)
 
-    # def evaluate(self, x):
-    #     """evaluating network with inputs and targets"""
-    #     return self.forward(x)[0]
 
 
 if __name__ == '__main__':
@@ -179,6 +189,6 @@ if __name__ == '__main__':
     net = Bisenet(19)
     # x = net(image)
     # print net
-    # print(net(image))
+    print(net(image))
 
 
